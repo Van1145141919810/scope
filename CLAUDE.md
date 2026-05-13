@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project overview
 
-SCOPE (Stochastic Cartographic Occupancy Prediction Engine) — a deep learning framework for occupancy grid map prediction in dynamic environments, published at IEEE T-RO 2025. Three model variants on separate branches: **scope++** (highest accuracy, `scope++` branch), **scope** (balanced, `scope` branch), **so-scope** (fastest inference for resource-limited robots, `so-scope` branch). Current branch: `scope`.
+SCOPE (Stochastic Cartographic Occupancy Prediction Engine) — deep learning for occupancy grid map prediction in dynamic environments, IEEE T-RO 2025. Three model variants on separate branches: **scope++** (highest accuracy), **scope** (balanced, current branch), **so-scope** (fastest inference).
 
-Architecture: **ConvLSTM + β-VAE**. A ConvLSTM encodes a 10-frame sequence of local occupancy grid maps into a latent representation, a VAE encoder maps it to a Gaussian latent space, and a decoder reconstructs the predicted future occupancy map.
+Architecture: **ConvLSTM + β-VAE**. A ConvLSTM encodes 10 frames of local occupancy grids → VAE encoder maps to Gaussian latent space → decoder reconstructs the predicted future occupancy map. Trained with `loss = BCE(pred, gt) + 0.01 × KL(q||p)`.
 
 ## Commands
 
@@ -14,66 +14,85 @@ Architecture: **ConvLSTM + β-VAE**. A ConvLSTM encodes a 10-frame sequence of l
 # Activate environment
 mamba activate scope
 
-# Create/update environment
+# Create/update environment from yaml
 mamba env create -f environment.yaml
 
-# Train (requires OGM-Datasets, see below)
+# Quick smoke test: verify env + model loading
+python test_env.py
+
+# Fast demo: 3 samples, ~25 seconds (for presentations)
+python quick_demo.py ~/data/OGM-datasets/OGM-Turtlebot2/test model/scope_model.pth
+
+# Train (requires OGM-Datasets; pre-trained model already exists)
 sh run_train.sh <path_to_train_dir> <path_to_val_dir>
 
-# Run inference demo with pre-trained model (requires OGM-Datasets)
+# Full inference demo on test set (very slow — 17k samples; use quick_demo.py instead)
 sh run_eval_demo.sh <path_to_test_dir>
-
-# Quick smoke test: load pre-trained model and run forward pass
-python test_env.py
 ```
+
+On Windows, shell scripts need Git Bash. Alternative: `mamba run -n scope python scripts/<script>.py <args>` from project root.
 
 ## Code architecture
 
-All source code is in `scripts/`. No external package structure — imports rely on `sys.path` or running from `scripts/` directory.
+All source in `scripts/`. Imports rely on `sys.path` or running from project root (scripts import from each other as flat modules). Every file now has detailed Chinese inline comments explaining each line.
 
-### Core files
+### Core files and data flow
 
-| File | Purpose |
-|------|---------|
-| `scripts/model.py` | **Main file.** Contains: (1) `scope` model class — ConvLSTM encoder → VAE encoder → reparameterization → decoder, (2) `VaeTestDataset` — reads `.npy` files of LiDAR scans/positions/velocities from dataset directories, (3) all architecture components (`Encoder`, `Decoder`, `Residual`, `ResidualStack`, `VAE_Encoder`), (4) global constants `SEQ_LEN=10`, `IMG_SIZE=64` |
-| `scripts/convlstm.py` | Standalone ConvLSTM cell + multi-layer wrapper. Adapted from `ndrplz/ConvLSTM_pytorch`. Only `ConvLSTMCell` is actually used by the model |
-| `scripts/local_occ_grid_map.py` | GPU-parallelized occupancy grid mapping. Uses Bresenham ray tracing to convert LiDAR scans to binary occupancy grids. Key class: `LocalMap` |
-| `scripts/bresenham_torch.py` | N-dimensional Bresenham line algorithm implemented in PyTorch (GPU-compatible) |
-| `scripts/train.py` | Training loop with β-VAE loss (`BCE + β*KL`). Uses `tensorboardX` for logging (not standard `tensorboard`). Loads data via `VaeTestDataset` from `model.py` |
-| `scripts/decode_demo.py` | Multi-step inference demo. Builds occupancy grids from test data, performs autoregressive 10-step prediction with 32 Monte Carlo samples, outputs comparison images to `output/` |
+```
+bresenham_torch.py          ← GPU Bresenham line algorithm (lowest-level utility)
+    ↓
+local_occ_grid_map.py       ← LiDAR → occupancy grid mapping (uses Bresenham for free space)
+    ↓
+convlstm.py                 ← ConvLSTM cell (spatial LSTM: convolutions replace matrix multiplies)
+    ↓
+model.py                    ← ★ Heart of the project:
+                               (1) VaeTestDataset — loads .npy sequences of LiDAR/pose/velocity
+                               (2) Residual/Encoder/Decoder — VAE building blocks
+                               (3) scope model — ConvLSTM → VAE_Encoder → reparameterize → Decoder
+    ↓
+train.py                    ← Training loop: β-VAE loss, supervised only on future frame 1
+    ↓
+decode_demo.py              ← Inference: autoregressive 10-step prediction with 32 MC samples
+```
 
-### Data flow
+### Key architectural decisions
 
-1. LiDAR scans (1080-point) + positions + velocities loaded as `.npy` files via `VaeTestDataset`
-2. `LocalMap` converts LiDAR data to 64×64 binary occupancy grids (past 10 and future 10 frames)
-3. Past frames → ConvLSTM → VAE encoder → latent z ~ N(μ, σ)
-4. Latent z → decoder → predicted occupancy grid (compared against future ground truth)
-5. Loss: `BCELoss(prediction, future_grid) + 0.01 * KL_divergence`
+- **Why log-odds for grid maps?** Probabilities can't be added directly. Log-odds can: `log_odds(p) = ln(p/(1-p))`. Prior p=0.5 → log_odds=0. Free space shifts negative, occupied shifts positive.
+- **Why reparameterization trick?** Sampling `z ~ N(μ,σ²)` is non-differentiable. Rewrite as `z = μ + ε·σ, ε~N(0,1)` — gradient flows through μ and σ.
+- **Why KL divergence in VAE?** Regularizes latent space toward N(0,1), making it smooth and continuous. Without it, the model degenerates to a standard autoencoder.
+- **Why β=0.01 (small KL weight)?** Prioritizes reconstruction accuracy over latent regularity. The occupancy prediction task needs precise spatial output.
+- **Why coordinate transform?** The robot moves during the 10-frame window. All past observations must be aligned to the predicted future reference frame before building grid maps.
 
-### Key constants
+### Key constants (defined in model.py)
 
-- `SEQ_LEN = 10` (10 past frames as input, predict 10 future frames)
-- `IMG_SIZE = 64` (64×64 grid maps)
-- `POINTS = 1080` (LiDAR scan points)
-- `NUM_LATENT_DIM = 512` (VAE latent dimension, reshaped to 2×16×16)
-- `BETA = 0.01` (KL divergence weight in β-VAE)
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `SEQ_LEN` | 10 | 10 past frames input, 10 future frames predicted |
+| `IMG_SIZE` | 64 | 64×64 grid map |
+| `POINTS` | 1080 | LiDAR scan points per frame |
+| `NUM_LATENT_DIM` | 512 | VAE latent dim (= 2 channels × 16×16) |
+| `BETA` | 0.01 | KL divergence weight in β-VAE loss |
 
 ### Pre-trained model
 
-`model/scope_model.pth` — trained on OGM-Turtlebot2 dataset (epoch 40). 730K parameters.
+`model/scope_model.pth` — trained on OGM-Turtlebot2 (epoch 40, 730K params). Loaded as:
+```python
+ckpt = torch.load('model/scope_model.pth', map_location=device)
+model.load_state_dict(ckpt['model'])  # ckpt also has ['optimizer'] and ['epoch']
+```
+
+## Supplementary files
+
+- `CODE_WALKTHROUGH.md` — 492-line detailed code walkthrough in Chinese, covers all 6 source files with diagrams and explanations
+- `test_env.py` — quick env + model loading verification
+- `quick_demo.py` — fast demo: 3 samples, autoregressive 10-step prediction with 32 Monte Carlo samples, outputs comparison images to `output/quick_mask*.png` and `output/quick_pred*.png`
 
 ## Dataset
 
-**OGM-Datasets** from [Zenodo](https://doi.org/10.5281/zenodo.7051560). Three subsets:
+OGM-Datasets from [Zenodo](https://doi.org/10.5281/zenodo.7051560) (~374 MB compressed). Three subsets: OGM-Turtlebot2 (simulated), OGM-Jackal (real outdoor), OGM-Spot (real indoor). Each has `{train,val,test}/` with `scans/`, `positions/`, `velocities/` subdirectories containing `.npy` files + index `.txt` files.
 
-- **OGM-Turtlebot2** — simulated Turtlebot2 in Gazebo lobby with 34 moving pedestrians
-- **OGM-Jackal** — real Jackal robot, outdoor UT Austin (from SCAND dataset)
-- **OGM-Spot** — real Spot robot, UT Austin Union Building (from SCAND dataset)
-
-Data structure per subset: `{train,val,test}/scans/`, `positions/`, `velocities/` directories with `.npy` files + a `.txt` file listing them per split.
+Pre-trained model is for Turtlebot2 only.
 
 ## Environment
 
-Created via `environment.yaml`. Original paper used Python 3.7 + PyTorch 1.7.1, but this env uses **Python 3.9 + PyTorch 2.7.1** for CUDA 12/13 compatibility. The code uses only standard PyTorch APIs, no version issues.
-
-Shell scripts (`run_train.sh`, `run_eval_demo.sh`) use Unix paths. On Windows, run from Git Bash or use `mamba run -n scope python scripts/...` directly.
+`environment.yaml` at project root. Original paper used Python 3.7 + PyTorch 1.7.1; this env uses Python 3.9 + PyTorch 2.7.1 (CUDA 12.8) for compatibility with modern GPUs. Code uses only standard PyTorch APIs — no version migration issues.

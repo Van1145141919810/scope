@@ -1,0 +1,14 @@
+name: scope
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - pytorch>=2.0
+  - torchvision>=0.15
+  - numpy
+  - matplotlib
+  - tqdm
+  - pip
+  - pip:
+    - tensorboardx

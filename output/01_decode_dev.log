@@ -1,1 +1,1 @@
-dataset length:  10890
+usage: python decode_demo.py [ODIR] [MDL_PATH] [EVAL_SET]

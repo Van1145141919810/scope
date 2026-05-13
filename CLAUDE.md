@@ -4,9 +4,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project overview
 
-SCOPE (Stochastic Cartographic Occupancy Prediction Engine) — deep learning for occupancy grid map prediction in dynamic environments, IEEE T-RO 2025. Three model variants on separate branches: **scope++** (highest accuracy), **scope** (balanced, current branch), **so-scope** (fastest inference).
+SCOPE (Stochastic Cartographic Occupancy Prediction Engine) — deep learning for occupancy grid map prediction in dynamic environments, IEEE T-RO 2025 (Vol. 41, pp. 4139–4158). arXiv: [2407.00144](https://arxiv.org/abs/2407.00144).
+
+Three model variants:
+- **SCOPE++** — full pipeline: robot motion compensation Λ(·) + dynamic object prediction κ(·) (ConvLSTM) + static object segmentation g(·) (GPU Bayesian mapping) + VAE predictor. Highest accuracy.
+- **SCOPE** (current branch) — omits static object module g(·); uses only ConvLSTM + VAE. Faster, comparable accuracy.
+- **SO-SCOPE** — knowledge-distilled: replaces VAE with a single convolutional layer + uncertainty lookup table. 89× faster than SOTA, 35 FPS on Jetson TX2.
 
 Architecture: **ConvLSTM + β-VAE**. A ConvLSTM encodes 10 frames of local occupancy grids → VAE encoder maps to Gaussian latent space → decoder reconstructs the predicted future occupancy map. Trained with `loss = BCE(pred, gt) + 0.01 × KL(q||p)`.
+
+Paper's formal decomposition (Eq. 3a–3d): the prediction model p_θ(o_{t+1} | d_{t-τ:t}) factorizes into:
+- **Λ(d)** — ego-motion compensation: constant velocity model predicts future robot pose, transforms all data to predicted frame R
+- **κ(o^R)** — ConvLSTM processes 10-frame OGM sequence for dynamic object prediction
+- **g(y^R)** — GPU-accelerated inverse sensor model (Bayesian log-odds update) for static environment map m
+- **VAE(z | ô, m)** — reparameterized sampling from learned latent distribution; 32 MC samples averaged for final prediction
 
 ## Commands
 
@@ -62,6 +73,8 @@ decode_demo.py              ← Inference: autoregressive 10-step prediction wit
 - **Why KL divergence in VAE?** Regularizes latent space toward N(0,1), making it smooth and continuous. Without it, the model degenerates to a standard autoencoder.
 - **Why β=0.01 (small KL weight)?** Prioritizes reconstruction accuracy over latent regularity. The occupancy prediction task needs precise spatial output.
 - **Why coordinate transform?** The robot moves during the 10-frame window. All past observations must be aligned to the predicted future reference frame before building grid maps.
+- **Why Monte Carlo sampling?** VAE is generative — each forward pass samples z ~ N(μ,σ²), producing a different prediction. Averaging 32 samples reduces variance and captures uncertainty.
+- **Why knowledge distillation (SCOPE → SO-SCOPE)?** The VAE decoder is memory-intensive (50% of memory, 17% of runtime). The "student" SO-SCOPE replaces it with one conv layer while preserving prediction accuracy via "soft" label training + uncertainty lookup table.
 
 ### Key constants (defined in model.py)
 
@@ -81,9 +94,22 @@ ckpt = torch.load('model/scope_model.pth', map_location=device)
 model.load_state_dict(ckpt['model'])  # ckpt also has ['optimizer'] and ['epoch']
 ```
 
+## Paper benchmarks (Jetson TX2, 8 GB)
+
+| Metric | ConvLSTM | DeepTracking | PhyDNet | LOPR | SCOPE | SCOPE++ | SO-SCOPE |
+|--------|----------|--------------|---------|------|-------|---------|----------|
+| FPS | 2.95 | 5.32 | 4.66 | 1.16 | **23.29** | 10.68 | **34.75** |
+| Model size (MB) | 12.44 | 0.95 | 37.17 | 1610 | 8.84 | 8.85 | **1.80** |
+| Memory (GB) | 0.70 | 0.63 | 0.71 | 5.00 | 0.66 | 0.66 | 0.66 |
+
+Three evaluation metrics (first to use OSPA for OGM prediction):
+- **WMSE** (↓): per-cell absolute error, weighted to balance occupied/free cells
+- **SSIM** (↑): structural similarity — captures scene geometry preservation
+- **OSPA** (↓): optimal subpattern assignment — multi-target tracking metric measuring object count + location errors
+
 ## Supplementary files
 
-- `CODE_WALKTHROUGH.md` — 492-line detailed code walkthrough in Chinese, covers all 6 source files with diagrams and explanations
+- `CODE_WALKTHROUGH.md` — detailed code walkthrough in Chinese, covers all 6 source files + paper formula mapping + software optimization explanation
 - `test_env.py` — quick env + model loading verification
 - `quick_demo.py` — fast demo: 3 samples, autoregressive 10-step prediction with 32 Monte Carlo samples, outputs comparison images to `output/quick_mask*.png` and `output/quick_pred*.png`
 

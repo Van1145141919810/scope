@@ -2,6 +2,40 @@
 
 > 用于组会讲解与复习。所有核心代码在 `scripts/` 目录下。
 > 顺序：bresenham_torch → convlstm → local_occ_grid_map → model → train → decode_demo
+> 论文: Xie & Dames, "SCOPE: Stochastic Cartographic Occupancy Prediction Engine for Uncertainty-Aware Dynamic Navigation", IEEE T-RO 2025. arXiv: [2407.00144](https://arxiv.org/abs/2407.00144)
+
+---
+
+## 论文核心公式 → 代码映射
+
+论文的核心问题（公式1）：已知历史 τ=10 帧的 LiDAR + 位姿 + 速度数据 d_{t-τ:t}，预测未来占用栅格分布 p_θ(o_{t+1} | d_{t-τ:t})。
+
+SCOPE 将此分解为三个模块（公式 3a-3d）：
+
+```
+o_{t+1} ~ p_θ(o_{t+1} | ô_{t+1}, m)           ← VAE 预测器 (model.py scope.forward)
+    ô_{t+1} = κ(o_{t-τ:t})                      ← ConvLSTM 动态物体预测 (convlstm.py + model.py)
+        o_{t-τ:t} = ψ(y^R_{t-τ:t})              ← LiDAR→OGM 转换 (local_occ_grid_map.py discretize)
+    m = g(y^R_{t-τ:t})                           ← 静态地图构建 (local_occ_grid_map.py update)
+        y^R_{t-τ:t} = Λ(d_{t-τ:t})              ← 自运动补偿 (local_occ_grid_map.py origin_pose_prediction)
+```
+
+训练损失为 ELBO（公式 5）：`L = E[log p_θ(o|z,ô,m)] - KL(q_φ(z|ô,m) || p_θ(z))`
+- 第一项 = BCE 重建损失（期望生成误差）
+- 第二项 = KL 散度（正则化，使潜在空间接近 N(0,1)）
+- 代码实现：`train.py` 中 `BCE(prediction, mask) + BETA * KL_loss`
+
+三种变体（论文 Fig. 2）：
+| 变体 | 静态模块 g(·) | VAE | 特点 |
+|------|--------------|-----|------|
+| **SCOPE++** | ✓ (GPU Bayesian mapping) | ✓ | 最高精度，最慢 |
+| **SCOPE** (当前分支) | ✗ (跳过) | ✓ | 精度相近，更快 |
+| **SO-SCOPE** | ✗ | ✗ (单层 Conv 替代) | 知识蒸馏 + 不确定性查表，35 FPS |
+
+软件优化（论文 Section IV）：
+- **资源分析**: VAE 占 50% 内存、17% 运行时间；静态模块占 53% 运行时间
+- **知识蒸馏**: SCOPE (teacher) → SO-SCOPE (student)，将 VAE 替换为单卷积层
+- **不确定性量化**: 用 8000 输入序列 × 32 VAE 样本 = 256000 输出，拟合截断正态+偏态柯西混合分布（公式 6），建立预计算查表
 
 ---
 
@@ -91,6 +125,8 @@ t=3   (3, 2)       (3, 2)   终点=障碍物
 
 ## ② `convlstm.py` — ConvLSTM 时序编码
 
+> 实现论文的 **κ(·) 动态物体预测模块**（公式 3b）—— 10 帧 OGM 序列的时空特征提取
+
 ### LSTM vs ConvLSTM
 
 普通 LSTM 用全连接处理 1D 向量，丢失空间结构。ConvLSTM 把矩阵乘法换为 **卷积**：
@@ -131,6 +167,8 @@ h_next = o * tanh(c_next)        # 输出：过滤后的记忆
 ---
 
 ## ③ `local_occ_grid_map.py` — GPU 并行占用栅格建图
+
+> 实现论文的两个模块：**Λ(·) 自运动补偿**（公式 3d）和 **g(·) 静态地图构建**（公式 3c）
 
 ### 为什么需要？
 
@@ -197,6 +235,8 @@ update() 方法用贝叶斯滤波累积多帧观测
 ---
 
 ## ④ `model.py` — 核心模型架构 + 数据集
+
+> 实现论文的 **VAE 预测器**（公式 3a/4/5）+ **ConvLSTM κ(·)**（公式 3b）+ 数据集加载
 
 这是整个项目最重要的文件（411 行），包含三大部分：**全局常量** → **数据集类** → **模型架构**。
 
@@ -508,4 +548,35 @@ for j in range(10):                      # 预测未来 10 帧
 17000 个测试样本，每个做 10 步自回归 × 32 MC × (1+2+...+10) = 320 次前向/样本 → **~544 万次前向传播**。`quick_demo.py` 限制 3 样本解决。
 
 ---
+
+## 补充：论文评估指标
+
+论文使用了三项指标（Section V-B1），这是 OGM 预测领域首次同时使用计算机视觉 + 多目标跟踪指标：
+
+| 指标 | 全称 | 含义 | 方向 |
+|------|------|------|------|
+| **WMSE** | Weighted Mean Square Error | 逐格绝对误差（加权平衡占/空） | ↓ 越小越好 |
+| **SSIM** | Structural Similarity Index Measure | 结构相似度（场景几何保持） | ↑ 越大越好 |
+| **OSPA** | Optimal Subpattern Assignment | 目标数量 + 位置误差（跟踪视角） | ↓ 越小越好 |
+
+OSPA 是本文首次引入 OGM 预测评估的指标，它从多目标跟踪角度评估"预测的障碍物位置和数量"是否正确，比纯图像指标更有物理意义。
+
+## 补充：软件优化（SO-SCOPE）
+
+当前分支是 SCOPE，论文还提出了 SO-SCOPE 作为压缩变体（Section IV-B）：
+
+1. **知识蒸馏**: SCOPE (teacher) → SO-SCOPE (student)
+   - Student = 1 个 ConvLSTM + 1 个 Conv 层（去掉整个 VAE）
+   - 用 teacher 的输出作为 "soft label" 训练，每次取 1 个随机样本（数据增强效果）
+   
+2. **不确定性量化**（Section IV-C）:
+   - 从 8000 个输入 × 32 VAE 样本 = 256000 输出中统计 VAE 行为
+   - 发现 VAE 输出分布 ≈ **截断正态 + 偏态柯西混合分布**（公式 6）
+   - 拟合参数后建立查表（15 bins × 10 timesteps = 150 组参数）
+   - SO-SCOPE 推理时：Conv 输出 ĉ → 查表 → 采样 c̃（无需运行 VAE）
+
+3. **效果**（Jetson TX2）:
+   - FPS: 23.29 (SCOPE) → **34.75** (SO-SCOPE)，89× 快于最慢的 SAAConvLSTM
+   - 模型: 8.84 MB → **1.80 MB**
+   - 内存几乎不随采样数增加（查表 vs 运行 VAE）
 
